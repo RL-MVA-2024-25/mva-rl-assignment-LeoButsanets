@@ -16,6 +16,23 @@ torch.manual_seed(42)
 
 env = TimeLimit(env=HIVPatient(domain_randomization=True), max_episode_steps=200)
 
+config = {'nb_actions': env.action_space.n,
+    'learning_rate': 0.001,
+    'gamma': 0.99,
+    'buffer_size': 100000,
+    'epsilon_min': 0.01,
+    'epsilon_max': 1.,
+    'epsilon_decay_period': 20000,
+    'epsilon_delay_decay': 20,
+    'batch_size': 500,
+    'gradient_steps': 5,
+    'update_target_strategy': 'replace', # or 'ema'
+    'update_target_freq': 700,
+    'update_target_tau': 0.005,
+    'criterion': torch.nn.SmoothL1Loss()}
+
+
+
 class ReplayBuffer:
     "Replay Buffer from the course on DQN"
     def __init__(self, capacity, device):
@@ -33,43 +50,20 @@ class ReplayBuffer:
         return list(map(lambda x:torch.Tensor(np.array(x)).to(self.device), list(zip(*batch))))
     def __len__(self):
         return len(self.data)
-
-
-def greedy_action(model, state):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    with torch.no_grad():
-        Q = model(torch.Tensor(state).unsqueeze(0).to(device))
-        return torch.argmax(Q).item()
-     
-
-
-class DQNModel(nn.Module):
-    def __init__(self, state_dim, nb_neurons, n_action, num_layers=2, device='cpu'):
-        """
-        Initialize the Deep Q-Network model.
-
-        Parameters:
-        - state_dim (int): Dimension of the state space.
-        - nb_neurons (int): Number of neurons in each hidden layer.
-        - n_action (int): Number of possible actions.
-        - num_layers (int): Number of hidden layers.
-        - device (str): Device to use ('cpu' or 'cuda').
-        """
-        super(DQNModel, self).__init__()
-        self.device = device
-
-        # Build the network dynamically based on the number of layers
-        layers = [nn.Linear(state_dim, nb_neurons), nn.ReLU()]
-        for _ in range(num_layers - 1):
-            layers.extend([nn.Linear(nb_neurons, nb_neurons), nn.ReLU()])
-        layers.append(nn.Linear(nb_neurons, n_action))  # Output layer
-
-        self.model = nn.Sequential(*layers).to(self.device)
-
-    def forward(self, x):
-        return self.model(x)
-
-
+        
+DQN = torch.nn.Sequential(
+            torch.nn.Linear(env.observation_space.shape[0], 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, env.action_space.n)
+)
 
 # ProjectAgent class to define agent logic
 class ProjectAgent:
@@ -78,26 +72,12 @@ class ProjectAgent:
         n_action = env.action_space.n
         nb_neurons = 256
         num_layers = 5
-
-        model = DQNModel(state_dim, nb_neurons, n_action, num_layers)
-        config = {'nb_actions': env.action_space.n,
-            'learning_rate': 0.001,
-            'gamma': 0.95,
-            'buffer_size': 1000000,
-            'epsilon_min': 0.01,
-            'epsilon_max': 1.,
-            'epsilon_decay_period': 1000,
-            'epsilon_delay_decay': 20,
-            'batch_size': 20,
-            'gradient_steps': 5,
-            'update_target_strategy': 'replace', # or 'ema'
-            'update_target_freq': 50,
-            'update_target_tau': 0.005,
-            'criterion': torch.nn.SmoothL1Loss()}
-
+   
         # Configuration for the agent
-        self.device = "cuda" if next(model.parameters()).is_cuda else "cpu"
-        self.model = model
+        self.model = DQN
+        self.device = "cuda" if next(self.model.parameters()).is_cuda else "cpu"
+        self.model = self.model.to(self.device)
+ 
         self.nb_actions = config['nb_actions']
         self.gamma = config['gamma'] if 'gamma' in config.keys() else 0.95
         self.batch_size = config['batch_size'] if 'batch_size' in config.keys() else 100
@@ -121,8 +101,6 @@ class ProjectAgent:
         self.criterion = config['criterion'] if 'criterion' in config.keys() else torch.nn.MSELoss()
         self.fine_tuning = config['fine_tuning'] if 'fine_tuning' in config.keys() else False
 
-        if not self.fine_tuning:
-            self.model = model.to(self.device)
         self.target_model = deepcopy(self.model).to(self.device)
         self.lr = config['learning_rate'] if 'learning_rate' in config.keys() else 0.001
         self.optimizer = config['optimizer'] if 'optimizer' in config.keys() else torch.optim.AdamW(self.model.parameters(), lr=self.lr)
@@ -135,17 +113,21 @@ class ProjectAgent:
             return torch.argmax(Q).item()
 
     def save(self, path):
-        torch.save(self.best_model.state_dict(), os.path.join(os.getcwd(), path))
+        path = os.path.join(os.getcwd(), path)
+        torch.save(self.best_model.state_dict(), path)
 
     def load(self,path="protocol_agent.pkl"):
         # get the folder of the folder 
-        self.model.load_state_dict(torch.load(os.path.join(os.getcwd(), path), map_location=self.device))
+        # Correct implementation
+        path = os.path.join(os.getcwd(), path)
+        state_dict = torch.load(path, map_location=self.device)  # Load the state dict with map_location
+        self.model.load_state_dict(state_dict)  # Load the state dict into the model
         
 
     def gradient_step(self):
         if len(self.memory) > self.batch_size:
             X, A, R, Y, D = self.memory.sample(self.batch_size)
-            QYmax = self.model(Y).max(1)[0].detach()
+            QYmax = self.target_model(Y).max(1)[0].detach()
             #update = torch.addcmul(R, self.gamma, 1-D, QYmax)
             update = torch.addcmul(R, 1-D, QYmax, value=self.gamma)
             QXA = self.model(X).gather(1, A.to(torch.long).unsqueeze(1))
@@ -203,7 +185,7 @@ class ProjectAgent:
                 # Save model if evaluation score improves
                 if val_score > previous_val:
                     previous_val = val_score
-                    self.best_model.load_state_dict(self.model.state_dict())
+                    self.best_model = deepcopy(self.model).to(self.device)
                 if episode % 10 ==0:
                     self.save("protocol_agent.pkl")
                 episode_return.append(episode_cum_reward)
@@ -211,27 +193,11 @@ class ProjectAgent:
             else:
                 state = next_state
 
-        return episode_return        
-
-
-def seed_everything(seed: int = 28):
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.cuda.manual_seed_all(seed)
-     
+        return episode_return           
 
 if __name__ == "__main__":
-    
+    print("Training the agent...")
     agent = ProjectAgent()
-    episode_return = agent.train(env, max_episode=200)
-    env.close()
-    print(f"Training return: {episode_return}")
-    print(f"Training return mean: {np.mean(episode_return)}")
-    print(f"Training return std: {np.std(episode_return)}")
-    print(f"Training return max: {np.max(episode_return)}")
-    print(f"Training return min: {np.min(episode_return)}")
+    agent.train(env, max_episode=200)
+    agent.save("protocol_agent.pkl")
+    print("Training complete. Model saved as protocol_agent.pkl")
